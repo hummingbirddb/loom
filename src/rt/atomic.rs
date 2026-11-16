@@ -110,12 +110,16 @@ pub(super) struct State {
     /// access to the cell.
     is_mutating: bool,
 
-    /// Last time the atomic was accessed. This tracks the dependent access for
-    /// the DPOR algorithm.
-    last_access: Option<Access>,
-
-    /// Last time the atomic was accessed for a store or rmw operation.
+    /// Last time the atomic was accessed for a store or rmw operation. Every
+    /// access is dependent with it. This tracks the dependent access for the
+    /// DPOR algorithm.
     last_non_load_access: Option<Access>,
+
+    /// Loads since the last store or rmw operation that no later load
+    /// happens after. A store or rmw operation is dependent with each of
+    /// them. Loads by the same thread are ordered, so there is at most one
+    /// entry per thread.
+    last_load_accesses: [Option<Access>; MAX_THREADS],
 
     /// Currently tracked stored values. This is the `MAX_ATOMIC_HISTORY` most
     /// recent stores to the atomic cell in loom execution order.
@@ -410,8 +414,8 @@ impl State {
             unsync_mut_at: VersionVec::new(),
             unsync_mut_locations: LocationSet::new(),
             is_mutating: false,
-            last_access: None,
             last_non_load_access: None,
+            last_load_accesses: Default::default(),
             stores: Default::default(),
             cnt: 0,
         };
@@ -824,24 +828,53 @@ impl State {
         one.iter_mut().chain(two.iter_mut())
     }
 
-    /// Returns the last dependent access
-    pub(super) fn last_dependent_access(&self, action: Action) -> Option<&Access> {
+    /// Returns the last store or rmw operation, which every access is
+    /// dependent with.
+    pub(super) fn last_dependent_access(&self) -> Option<&Access> {
+        self.last_non_load_access.as_ref()
+    }
+
+    /// Returns the loads that `action` is dependent with, in addition to
+    /// `last_dependent_access`.
+    ///
+    /// Two loads are independent. A store or rmw operation is dependent with
+    /// every load, and the tracked loads are the ones that are not already
+    /// ordered before another tracked access.
+    pub(super) fn dependent_load_accesses(&self, action: Action) -> &[Option<Access>] {
         match action {
-            Action::Load => self.last_non_load_access.as_ref(),
-            _ => self.last_access.as_ref(),
+            Action::Load => &[],
+            _ => &self.last_load_accesses,
         }
     }
 
     /// Sets the last dependent access
     pub(super) fn set_last_access(&mut self, action: Action, path_id: usize, version: &VersionVec) {
-        // Always set `last_access`
-        Access::set_or_create(&mut self.last_access, path_id, version);
-
         match action {
-            Action::Load => {}
+            Action::Load => {
+                // A load that happens before this one is ordered before any
+                // access that this one is ordered before, so this load
+                // replaces it. That includes the thread's previous load,
+                // which leaves a free slot.
+                let mut free = None;
+
+                for slot in &mut self.last_load_accesses {
+                    if slot
+                        .as_ref()
+                        .map_or(true, |load| load.happens_before(version))
+                    {
+                        *slot = None;
+                        free = Some(slot);
+                    }
+                }
+
+                *free.expect("[loom internal bug] more concurrent loads than threads") =
+                    Some(Access::new(path_id, version));
+            }
             _ => {
-                // Stores / RMWs
+                // Stores / RMWs. The operation joined every tracked load, so
+                // each one happens before any later access.
                 Access::set_or_create(&mut self.last_non_load_access, path_id, version);
+                self.last_load_accesses = Default::default();
             }
         }
     }

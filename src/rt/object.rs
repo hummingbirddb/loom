@@ -208,10 +208,23 @@ impl<T> Store<T> {
 }
 
 impl Store {
-    pub(super) fn last_dependent_access(&self, operation: Operation) -> Option<&Access> {
+    /// Returns every earlier access that `operation` is dependent with and
+    /// that is not known to be ordered before another one returned.
+    pub(super) fn dependent_accesses(&self, operation: Operation) -> impl Iterator<Item = &Access> {
+        let loads = match &self.entries[operation.obj.index] {
+            Entry::Atomic(entry) => entry.dependent_load_accesses(operation.action.into()),
+            _ => &[],
+        };
+
+        self.last_dependent_access(operation)
+            .into_iter()
+            .chain(loads.iter().flatten())
+    }
+
+    fn last_dependent_access(&self, operation: Operation) -> Option<&Access> {
         match &self.entries[operation.obj.index] {
             Entry::Arc(entry) => entry.last_dependent_access(operation.action.into()),
-            Entry::Atomic(entry) => entry.last_dependent_access(operation.action.into()),
+            Entry::Atomic(entry) => entry.last_dependent_access(),
             Entry::Mutex(entry) => entry.last_dependent_access(),
             Entry::Condvar(entry) => entry.last_dependent_access(),
             Entry::Notify(entry) => entry.last_dependent_access(),
